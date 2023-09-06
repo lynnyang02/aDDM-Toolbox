@@ -24,10 +24,13 @@ Author: Lynn Yang, lynnyang@caltech.edu
 
 Implementation of the classic drift-diffusion model (DDM), as described by
 Ratcliff et al. (1998).
+
+Based on Python addm_toolbox from Gabriela Tavares, gtavares@caltech.edu.
 """
 
 using Random
 using Distributions
+using Base.Threads
 
 include("ddm.jl")
 
@@ -216,18 +219,9 @@ function aDDM_get_trial_likelihood(addm::aDDM, trial::aDDMTrial; timeStep::Numbe
     
     time = 1
     
-    changeMatrix = states .- reshape(states, 1, :)
-    changeUp = (barrierUp .- reshape(states, 1, :))'
-    changeDown = (barrierDown .- reshape(states, 1, :) )'
-    
-    normpdf = similar(changeMatrix)
-    
-    # Iterate over all fixations in this trial.
-    for (fItem, fTime) in zip(correctedFixItem, correctedFixTime)
-        # We use a normal distribution to model changes in RDV
-        # stochastically. The mean of the distribution (the change most
-        # likely to occur) is calculated from the model parameters and from
-        # the item values.
+    # Dictionary of μ values from fItem.
+    μDict = Dict{Number, Number}()
+    for fItem in 0:2
         if fItem == 1
             μ = addm.d * (trial.ddmTrial.valueLeft - (addm.θ * trial.ddmTrial.valueRight))
         elseif fItem == 2
@@ -235,6 +229,41 @@ function aDDM_get_trial_likelihood(addm::aDDM, trial::aDDMTrial; timeStep::Numbe
         else
             μ = 0
         end
+        
+        μDict[fItem] = μ
+    end 
+    
+    changeMatrix = states .- reshape(states, 1, :)
+    changeUp = (barrierUp .- reshape(states, 1, :))'
+    changeDown = (barrierDown .- reshape(states, 1, :) )'
+    
+    pdfDict = Dict{Number, Any}()
+    cdfUpDict = Dict{Number, Any}()
+    cdfDownDict = Dict{Number, Any}() 
+    
+    for fItem in 0:2
+        normpdf = similar(changeMatrix)
+        cdfUp = similar(changeUp[:, time])
+        cdfDown = similar(changeDown[:, time])
+        
+        @. normpdf = pdf(Normal(μDict[fItem], addm.σ), changeMatrix)
+        @. cdfUp = cdf(Normal(μDict[fItem], addm.σ), changeUp[:, time])
+        @. cdfDown = cdf(Normal(μDict[fItem], addm.σ), changeDown[:, time])
+        pdfDict[fItem] = normpdf
+        cdfUpDict[fItem] = cdfUp
+        cdfDownDict[fItem] = cdfDown
+    end
+    
+    # Iterate over all fixations in this trial.
+    for (fItem, fTime) in zip(correctedFixItem, correctedFixTime)
+        # We use a normal distribution to model changes in RDV
+        # stochastically. The mean of the distribution (the change most
+        # likely to occur) is calculated from the model parameters and from
+        # the item values.
+        μ = μDict[fItem]
+        normpdf = pdfDict[fItem]
+        cdfUp = cdfUpDict[fItem]
+        cdfDown = cdfDownDict[fItem]
         
         # Iterate over the time interval of this fixation.
         for t in 1:Int64(fTime ÷ timeStep)
@@ -245,8 +274,6 @@ function aDDM_get_trial_likelihood(addm::aDDM, trial::aDDMTrial; timeStep::Numbe
             # B. We multiply the probability by the stateStep to ensure
             # that the area under the curves for the probability 
             # distributions probUpCrossing and probDownCrossing add up to 1.
-            
-            @. normpdf = pdf(Normal(μ, addm.σ), changeMatrix)
             prStatesNew = stateStep * (normpdf * prStates[:,time])
             prStatesNew[(states .>= 1) .| (states .<= -1)] .= 0
             
@@ -255,11 +282,6 @@ function aDDM_get_trial_likelihood(addm::aDDM, trial::aDDMTrial; timeStep::Numbe
             # A, of the proability of being in A at the previous timestep
             # times the probability of crossing the barrier if A is the
             # previous state.
-            cdfUp = similar(changeUp[:, time])
-            cdfDown = similar(changeDown[:, time])
-            @. cdfUp = cdf(Normal(μ, addm.σ), changeUp[:, time])
-            @. cdfDown = cdf(Normal(μ, addm.σ), changeDown[:, time])
-            
             tempUpCross = dot(prStates[:,time], 1 .- cdfUp)
             tempDownCross = dot(prStates[:,time], cdfDown)
             
@@ -507,6 +529,26 @@ function aDDM_simulate_trial_data(addm::aDDM, fixationData::FixationData, n::Int
 end
 
 
+function aDDM_simulate_trial_data_threads(addm::aDDM, fixationData::FixationData, n::Int64; cutOff::Int64 = 20000)
+    """
+    Args:
+      addm: aDDM object.
+      fixationData: FixationData object.
+      n: Number of trials to be simulated.
+      valueLeft: value of the left item.
+      valueRight: value of the right item.
+    Returns:
+      addmTrials: Vector of aDDMTrial.s 
+    """
+    addmTrials = Vector{aDDMTrial}(undef, n)
+    @threads for i in 1:n
+        addmTrials[i] = aDDM_simulate_trial(addm, fixationData, rand(0:5), rand(0:5), cutOff=cutOff)
+    end
+
+    return addmTrials
+end
+
+
 function aDDM_negative_log_likelihood(addmTrials::Vector{aDDMTrial}, d::Number, σ::Number, θ::Number)
     """
     Calculates the negative log likelihood from a given dataset of DDMTrials and parameters
@@ -529,3 +571,43 @@ function aDDM_negative_log_likelihood(addmTrials::Vector{aDDMTrial}, d::Number, 
     return negative_log_likelihood
 end
 
+
+function aDDM_negative_log_likelihood_threads(addm::aDDM, addmTrials::Vector{aDDMTrial}, d::Number, σ::Number, θ::Number)
+    """
+    Calculates the negative log likelihood from a given dataset of DDMTrials and parameters
+    of a model.
+    Args:
+      addmTrials: Vector of aDDMTrials.
+      d: Number, parameter of the model which controls the speed of integration of
+          the signal. 
+      σ: Number, parameter of the model, standard deviation for the normal
+          distribution.
+    Returns: 
+      The negative log likelihood for the given vector of aDDMTrials and model.
+    """
+    # Calculate the negative log likelihood
+    addm = aDDM(d, σ, θ)
+    likelihoods = Vector{Float64}(undef, length(addmTrials))
+    
+    @threads for i in 1:length(addmTrials)
+        likelihoods[i] = aDDM_get_trial_likelihood(addm, addmTrials[i])
+    end
+    
+    likelihoods = max.(likelihoods, 1e-64)
+    negative_log_likelihood = -sum(log.(likelihoods))
+    
+    return negative_log_likelihood
+end
+
+
+function aDDM_total_likelihood(addmTrials::Vector{aDDMTrial}, d::Number, σ::Number, θ::Number)
+    addm = aDDM(d, σ, θ)
+    likelihoods = Vector{Float64}(undef, length(addmTrials))
+    
+    @threads for i in 1:length(addmTrials)
+        likelihoods[i] = aDDM_get_trial_likelihood(addm, addmTrials[i])
+    end
+
+    total_likelihood = sum(likelihoods)
+    return total_likelihood
+end
